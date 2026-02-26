@@ -5,24 +5,26 @@ import requests
 from bs4 import BeautifulSoup
 import logging
 import time
-import pytz  # 👈 Timezone ke liye
+import pytz
+import re
+import random
+from fake_useragent import UserAgent
 
 # Logging setup
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
-CORS(app)  # 👈 Enable CORS for all routes
+CORS(app)  # Enable CORS for all routes
 
-# User-agent for NTES
-HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-    'Accept-Language': 'en-US,en;q=0.5',
-    'Accept-Encoding': 'gzip, deflate',
-    'Connection': 'keep-alive',
-    'Upgrade-Insecure-Requests': '1',
-}
+# Fallback user agents
+USER_AGENTS = [
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15',
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; rv:109.0) Gecko/20100101 Firefox/121.0',
+    'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1',
+]
 
 # India timezone
 ist = pytz.timezone('Asia/Kolkata')
@@ -52,7 +54,8 @@ def home():
         "endpoints": {
             "/": "This info",
             "/health": "Health check",
-            "/status/<train_number>": "Get live train status"
+            "/sources/status": "Check data source availability",
+            "/status/<train_number>": "Get live train status (multi-source)"
         }
     })
 
@@ -85,106 +88,61 @@ def health():
         "uptime": "running"
     })
 
-# 👇 MAIN ENDPOINT - Get train status
-@app.route('/status/<train_no>')
-def get_train_status(train_no):
-    logger.info(f"🔵 Request received for train: {train_no}")
-    logger.info(f"🕐 Server time IST: {get_india_datetime()}")
-    
-    # ✅ INDIA TIME USE KARO
-    today = get_india_date()
-    logger.info(f"📅 India date: {today}")
-    
-    # Try today's date first
-    result = fetch_data_with_retry(train_no, today)
-    
-    # If today fails, try yesterday
-    if not result:
-        yesterday = get_india_date_offset(-1)
-        logger.info(f"⚠️ No data for today, trying yesterday: {yesterday}")
-        result = fetch_data_with_retry(train_no, yesterday)
-    
-    # If yesterday fails, try day before
-    if not result:
-        day_before = get_india_date_offset(-2)
-        logger.info(f"⚠️ No data for yesterday, trying day before: {day_before}")
-        result = fetch_data_with_retry(train_no, day_before)
-    
-    if result:
-        logger.info(f"✅ Data found for train {train_no}")
-        # Add server timestamp to response
-        result['server_time_ist'] = get_india_datetime()
-        return jsonify(result)
-    else:
-        logger.error(f"❌ No data found for train {train_no} after 3 date attempts")
-        return jsonify({
-            "error": "Train data not found",
-            "train_no": train_no,
-            "message": "Please check train number or try again later",
-            "server_time_ist": get_india_datetime(),
-            "dates_tried": [today, get_india_date_offset(-1), get_india_date_offset(-2)]
-        }), 404
+# ============================================================================
+# NTES SCRAPER (Original)
+# ============================================================================
 
-# 👇 FETCH DATA WITH RETRY LOGIC
-def fetch_data_with_retry(train_no, target_date, max_retries=3):
-    """Fetch data from NTES with retry logic and timeout handling"""
+HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.5',
+    'Accept-Encoding': 'gzip, deflate',
+    'Connection': 'keep-alive',
+    'Upgrade-Insecure-Requests': '1',
+}
+
+def fetch_data_with_retry(train_no, target_date, max_retries=2):
+    """Fetch data from NTES with retry logic"""
     
     url = f"https://enquiry.indianrail.gov.in/mntes/?opt=TrainRunning&subOpt=FindTrain&trainNo={train_no}&date={target_date}"
-    logger.info(f"📡 Fetching URL: {url}")
+    logger.info(f"📡 NTES Fetching: {url}")
     
     for attempt in range(max_retries):
         try:
-            logger.info(f"📡 Attempt {attempt + 1}/{max_retries} for train {train_no} on date {target_date}")
+            logger.info(f"📡 NTES Attempt {attempt + 1}/{max_retries} for train {train_no} on date {target_date}")
             
-            # 👉 TIMEOUT 30 seconds (connect + read)
-            response = requests.get(url, headers=HEADERS, timeout=30)
-            
-            logger.info(f"📡 Response status: {response.status_code}")
-            logger.info(f"📡 Response size: {len(response.text)} bytes")
+            response = requests.get(url, headers=HEADERS, timeout=25)
+            logger.info(f"📡 NTES Response status: {response.status_code}")
             
             if response.status_code == 200:
-                # Parse HTML response
                 data = parse_ntes_html(response.text, train_no, target_date)
                 if data:
-                    logger.info(f"✅ Successfully parsed data for {train_no}")
+                    logger.info(f"✅ NTES Success for {train_no}")
                     return data
                 else:
-                    logger.warning(f"⚠️ Parsed data is None - HTML structure may have changed")
-                    # Log first 500 chars of HTML for debugging
-                    logger.debug(f"HTML preview: {response.text[:500]}")
+                    logger.warning(f"⚠️ NTES parsed data is None")
             else:
-                logger.warning(f"⚠️ Status code: {response.status_code}")
+                logger.warning(f"⚠️ NTES status code: {response.status_code}")
                 
         except requests.exceptions.Timeout:
-            logger.warning(f"⏰ Timeout on attempt {attempt + 1}")
+            logger.warning(f"⏰ NTES timeout on attempt {attempt + 1}")
             if attempt < max_retries - 1:
-                wait_time = 2 ** attempt  # Exponential backoff: 1, 2, 4 seconds
+                wait_time = 2
                 logger.info(f"⏳ Waiting {wait_time} seconds before retry...")
                 time.sleep(wait_time)
-                
-        except requests.exceptions.ConnectionError as e:
-            logger.error(f"🔌 Connection error: {e}")
-            if attempt < max_retries - 1:
-                wait_time = 5
-                logger.info(f"⏳ Waiting {wait_time} seconds before retry...")
-                time.sleep(wait_time)
-            else:
-                break
-                
         except Exception as e:
-            logger.error(f"❌ Unexpected error: {e}")
+            logger.error(f"❌ NTES error: {e}")
             break
             
     return None
 
-# 👇 PARSE NTES HTML
 def parse_ntes_html(html, train_no, target_date):
     """Extract train information from NTES HTML"""
     
     try:
         soup = BeautifulSoup(html, 'html.parser')
         
-        # Try different selectors for train name
+        # Train name
         train_name = None
         selectors = [
             soup.find('span', {'id': 'lblTrainName'}),
@@ -192,7 +150,6 @@ def parse_ntes_html(html, train_no, target_date):
             soup.find('h3'),
             soup.find('h2'),
             soup.find('title'),
-            soup.find('font', {'size': '4'})  # Older NTES format
         ]
         
         for selector in selectors:
@@ -204,13 +161,11 @@ def parse_ntes_html(html, train_no, target_date):
         if not train_name or train_name == '':
             train_name = f"Train {train_no}"
         
-        # Try to get status
+        # Status
         status = "Running"
         status_selectors = [
             soup.find('span', {'id': 'lblRunningStatus'}),
             soup.find('div', {'class': 'status'}),
-            soup.find('p', {'class': 'running-status'}),
-            soup.find('td', text=lambda t: t and 'status' in t.lower())
         ]
         
         for selector in status_selectors:
@@ -218,13 +173,12 @@ def parse_ntes_html(html, train_no, target_date):
                 status = selector.text.strip()
                 break
         
-        # Try to get current location
+        # Current location
         current_location = "N/A"
         location_selectors = [
             soup.find('span', {'id': 'lblLastLocation'}),
             soup.find('div', {'class': 'location'}),
             soup.find('span', {'id': 'lblCurrentStation'}),
-            soup.find('td', text=lambda t: t and 'current' in t.lower())
         ]
         
         for selector in location_selectors:
@@ -232,7 +186,7 @@ def parse_ntes_html(html, train_no, target_date):
                 current_location = selector.text.strip()
                 break
         
-        # Try to get delay
+        # Delay
         delay = 0
         delay_selectors = [
             soup.find('span', {'id': 'lblDelay'}),
@@ -243,25 +197,22 @@ def parse_ntes_html(html, train_no, target_date):
         for selector in delay_selectors:
             if selector and selector.text:
                 delay_text = selector.text.strip()
-                import re
                 numbers = re.findall(r'\d+', delay_text)
                 if numbers:
                     delay = int(numbers[0])
                 break
         
-        # Try to get source and destination
+        # Source and destination
         source = "N/A"
         destination = "N/A"
         
-        # Method 1: Look for station codes
         station_spans = soup.find_all('span', {'class': 'station-code'})
         if station_spans and len(station_spans) >= 2:
             source = station_spans[0].text.strip()
             destination = station_spans[-1].text.strip()
         else:
-            # Method 2: Look in text
+            # Try to find in text
             text = soup.get_text()
-            import re
             station_codes = re.findall(r'[A-Z]{4}', text)
             if station_codes and len(station_codes) >= 2:
                 source = station_codes[0]
@@ -276,19 +227,284 @@ def parse_ntes_html(html, train_no, target_date):
             "date": target_date,
             "last_updated": datetime.now(ist).strftime("%H:%M:%S"),
             "source": source,
-            "destination": destination
+            "destination": destination,
+            "data_source": "NTES"
         }
         
     except Exception as e:
-        logger.error(f"❌ Error parsing HTML: {e}")
+        logger.error(f"❌ NTES parse error: {e}")
         return None
 
-# 👇 Run the app
+# ============================================================================
+# RAILYATRI SCRAPER
+# ============================================================================
+
+def fetch_from_railyatri(train_no):
+    """RailYatri se train data scrape karo"""
+    try:
+        ua = UserAgent()
+        headers = {
+            'User-Agent': ua.random,
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.5',
+            'Referer': 'https://www.railyatri.in/',
+        }
+    except:
+        headers = {
+            'User-Agent': random.choice(USER_AGENTS),
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        }
+    
+    url = f"https://www.railyatri.in/train-tracking/{train_no}"
+    logger.info(f"📡 RailYatri: Fetching {train_no}...")
+    
+    try:
+        response = requests.get(url, headers=headers, timeout=20)
+        if response.status_code != 200:
+            logger.warning(f"RailYatri status: {response.status_code}")
+            return None
+        
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        # Train name
+        train_name = None
+        selectors = [
+            soup.find('h1', class_='train-heading'),
+            soup.find('div', class_='train-name'),
+            soup.find('title')
+        ]
+        for sel in selectors:
+            if sel and sel.text:
+                train_name = sel.text.strip()
+                break
+        
+        # Current location
+        current_location = "N/A"
+        loc_selectors = [
+            soup.find('span', class_='current-location'),
+            soup.find('div', class_='live-location'),
+            soup.find('div', class_='station-name')
+        ]
+        for sel in loc_selectors:
+            if sel and sel.text:
+                current_location = sel.text.strip()
+                break
+        
+        # Delay
+        delay = 0
+        delay_elem = soup.find('span', class_='delay-value')
+        if delay_elem:
+            numbers = re.findall(r'\d+', delay_elem.text)
+            if numbers:
+                delay = int(numbers[0])
+        
+        # Source/Destination
+        source = "N/A"
+        destination = "N/A"
+        station_codes = soup.find_all('span', class_='station-code')
+        if station_codes and len(station_codes) >= 2:
+            source = station_codes[0].text.strip()
+            destination = station_codes[-1].text.strip()
+        
+        # Last updated time
+        last_updated = datetime.now(ist).strftime("%H:%M:%S")
+        time_elem = soup.find('span', class_='update-time')
+        if time_elem:
+            last_updated = time_elem.text.strip()
+        
+        return {
+            "train_no": train_no,
+            "train_name": train_name or f"Train {train_no}",
+            "status": "Running",
+            "current_location": current_location,
+            "delay_minutes": delay,
+            "date": get_india_date(),
+            "last_updated": last_updated,
+            "source": source,
+            "destination": destination,
+            "data_source": "RailYatri"
+        }
+    except Exception as e:
+        logger.error(f"❌ RailYatri error: {e}")
+        return None
+
+# ============================================================================
+# IXIGO SCRAPER
+# ============================================================================
+
+def fetch_from_ixigo(train_no):
+    """Ixigo se train data scrape karo"""
+    try:
+        ua = UserAgent()
+        headers = {'User-Agent': ua.random}
+    except:
+        headers = {'User-Agent': random.choice(USER_AGENTS)}
+    
+    url = f"https://www.ixigo.com/trains/{train_no}/live-train-status"
+    logger.info(f"📡 Ixigo: Fetching {train_no}...")
+    
+    try:
+        response = requests.get(url, headers=headers, timeout=20)
+        if response.status_code != 200:
+            logger.warning(f"Ixigo status: {response.status_code}")
+            return None
+        
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        # Train name
+        train_name = None
+        h1 = soup.find('h1')
+        if h1:
+            train_name = h1.text.strip()
+        
+        # Current location
+        current_location = "N/A"
+        loc_selectors = [
+            soup.find('div', class_='current-location'),
+            soup.find('span', class_='station-name'),
+            soup.find('div', class_='live-location')
+        ]
+        for sel in loc_selectors:
+            if sel and sel.text:
+                current_location = sel.text.strip()
+                break
+        
+        # Delay
+        delay = 0
+        delay_selectors = [
+            soup.find('span', class_='delay'),
+            soup.find('div', class_='delay-info')
+        ]
+        for sel in delay_selectors:
+            if sel and sel.text:
+                numbers = re.findall(r'\d+', sel.text)
+                if numbers:
+                    delay = int(numbers[0])
+                break
+        
+        return {
+            "train_no": train_no,
+            "train_name": train_name or f"Train {train_no}",
+            "status": "Running",
+            "current_location": current_location,
+            "delay_minutes": delay,
+            "date": get_india_date(),
+            "last_updated": datetime.now(ist).strftime("%H:%M:%S"),
+            "source": "N/A",
+            "destination": "N/A",
+            "data_source": "Ixigo"
+        }
+    except Exception as e:
+        logger.error(f"❌ Ixigo error: {e}")
+        return None
+
+# ============================================================================
+# MULTI-SOURCE FETCHER
+# ============================================================================
+
+def fetch_train_data_multi_source(train_no):
+    """Multiple sources se train data fetch karo"""
+    
+    # Priority order
+    sources = [
+        {"name": "NTES", "func": lambda t: fetch_data_with_retry(t, get_india_date())},
+        {"name": "RailYatri", "func": fetch_from_railyatri},
+        {"name": "Ixigo", "func": fetch_from_ixigo},
+    ]
+    
+    # Agar NTES fail ho to yesterday try karo
+    def try_ntes_with_yesterday(t):
+        result = fetch_data_with_retry(t, get_india_date())
+        if not result:
+            yesterday = get_india_date_offset(-1)
+            logger.info(f"📅 NTES trying yesterday: {yesterday}")
+            result = fetch_data_with_retry(t, yesterday)
+        return result
+    
+    sources[0]["func"] = try_ntes_with_yesterday
+    
+    for source in sources:
+        logger.info(f"🔍 Trying {source['name']}...")
+        data = source['func'](train_no)
+        
+        if data:
+            logger.info(f"✅ Success from {source['name']}")
+            data['source_used'] = source['name']
+            return data
+        
+        logger.info(f"⚠️ {source['name']} failed, waiting 1 second...")
+        time.sleep(1)
+    
+    logger.error(f"❌ All sources failed for train {train_no}")
+    return None
+
+# ============================================================================
+# SOURCE STATUS ENDPOINT
+# ============================================================================
+
+@app.route('/sources/status')
+def sources_status():
+    """Check which sources are working"""
+    
+    def check_ntes():
+        try:
+            r = requests.get("https://enquiry.indianrail.gov.in", timeout=5)
+            return r.status_code == 200
+        except:
+            return False
+    
+    def check_railyatri():
+        try:
+            r = requests.get("https://www.railyatri.in", timeout=5)
+            return r.status_code == 200
+        except:
+            return False
+    
+    def check_ixigo():
+        try:
+            r = requests.get("https://www.ixigo.com", timeout=5)
+            return r.status_code == 200
+        except:
+            return False
+    
+    return jsonify({
+        "ntes": check_ntes(),
+        "railyatri": check_railyatri(),
+        "ixigo": check_ixigo(),
+        "timestamp": get_india_datetime()
+    })
+
+# ============================================================================
+# MAIN STATUS ENDPOINT
+# ============================================================================
+
+@app.route('/status/<train_no>')
+def get_train_status_multi(train_no):
+    logger.info(f"🔵 Multi-source request for train: {train_no}")
+    logger.info(f"🕐 Server time IST: {get_india_datetime()}")
+    
+    result = fetch_train_data_multi_source(train_no)
+    
+    if result:
+        return jsonify(result)
+    else:
+        return jsonify({
+            "error": "Train data not found from any source",
+            "train_no": train_no,
+            "message": "All railway data sources are currently unavailable. Please try again later.",
+            "server_time_ist": get_india_datetime()
+        }), 404
+
+# ============================================================================
+# RUN APP
+# ============================================================================
+
 if __name__ == "__main__":
     logger.info("🚂 Railway API Server Starting...")
     logger.info(f"🕐 Server time IST: {get_india_datetime()}")
     logger.info("📍 Endpoints:")
     logger.info("   - /")
     logger.info("   - /health")
+    logger.info("   - /sources/status")
     logger.info("   - /status/<train_number>")
     app.run(host='0.0.0.0', port=5000, debug=False)
